@@ -1,5 +1,9 @@
 # AWS Emulator TUI
 
+[![CI](https://github.com/vinycalves/aws-emulator-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/vinycalves/aws-emulator-tui/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/vinycalves/aws-emulator-tui)](https://github.com/vinycalves/aws-emulator-tui/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A terminal console for [AWS Emulator](https://github.com/aws/aws-emulator) — browse
 resources, create and delete them, invoke any operation, and start or stop the
 emulator, without leaving the terminal.
