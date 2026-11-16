@@ -105,7 +105,7 @@ console, including services that have no curated screen.
 Requirements: a Rust toolchain, and AWS Emulator.
 
 ```bash
-git clone https://github.com/vinycius/aws-emulator-tui.git
+git clone https://github.com/vinycalves/aws-emulator-tui.git
 cd aws-emulator-tui
 cargo install --path crates/emu-tui
 ```
