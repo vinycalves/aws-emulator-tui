@@ -1,16 +1,19 @@
 //! Application state, background work and key handling.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use emu_core::catalog;
 use emu_core::client::{ApiError, ApiResponse};
 use emu_core::config::{self, ConnectionConfig};
+use emu_core::generic::{self, GenericTable, Token};
 use emu_core::services::{self, CreateKind, Row, Table, ViewId, WriteAction};
+use emu_core::sigv4;
 use emu_core::{EmulatorClient, Supervisor};
 use ratatui::widgets::{ListState, TableState};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tui_textarea::TextArea;
 
@@ -19,17 +22,25 @@ use crate::theme;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
     Explorer,
+    Browse,
     Console,
     Emulator,
     Requests,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Explorer, Tab::Console, Tab::Emulator, Tab::Requests];
+    pub const ALL: [Tab; 5] = [
+        Tab::Explorer,
+        Tab::Browse,
+        Tab::Console,
+        Tab::Emulator,
+        Tab::Requests,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Explorer => "Explorer",
+            Tab::Browse => "Browse",
             Tab::Console => "Console",
             Tab::Emulator => "Emulator",
             Tab::Requests => "Requests",
@@ -38,7 +49,8 @@ impl Tab {
 
     fn next(self) -> Tab {
         match self {
-            Tab::Explorer => Tab::Console,
+            Tab::Explorer => Tab::Browse,
+            Tab::Browse => Tab::Console,
             Tab::Console => Tab::Emulator,
             Tab::Emulator => Tab::Requests,
             Tab::Requests => Tab::Explorer,
@@ -48,7 +60,8 @@ impl Tab {
     fn previous(self) -> Tab {
         match self {
             Tab::Explorer => Tab::Requests,
-            Tab::Console => Tab::Explorer,
+            Tab::Browse => Tab::Explorer,
+            Tab::Console => Tab::Browse,
             Tab::Emulator => Tab::Console,
             Tab::Requests => Tab::Emulator,
         }
@@ -166,6 +179,49 @@ impl ExplorerState {
     }
 }
 
+pub struct BrowseState {
+    pub service: String,
+    pub operation: String,
+    pub input: Value,
+    pub table: Option<GenericTable>,
+    pub table_state: TableState,
+    pub filter: Option<String>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub status: Option<(u16, u128)>,
+    pub token: Option<Token>,
+    pub generation: u64,
+}
+
+impl BrowseState {
+    pub fn visible_rows(&self) -> Vec<&emu_core::generic::GenericRow> {
+        let Some(table) = &self.table else {
+            return Vec::new();
+        };
+        match &self.filter {
+            None => table.rows.iter().collect(),
+            Some(needle) => {
+                let needle = needle.to_ascii_lowercase();
+                table
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        row.cells
+                            .iter()
+                            .any(|cell| cell.to_ascii_lowercase().contains(&needle))
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    pub fn selected_row(&self) -> Option<&emu_core::generic::GenericRow> {
+        let rows = self.visible_rows();
+        let index = self.table_state.selected().unwrap_or(0);
+        rows.get(index).copied()
+    }
+}
+
 pub struct ConsoleState {
     pub service: String,
     pub operation: String,
@@ -203,6 +259,7 @@ pub struct App {
     pub identity: String,
     pub tab: Tab,
     pub explorer: ExplorerState,
+    pub browse: BrowseState,
     pub console: ConsoleState,
     pub emulator: EmulatorState,
     pub services: Vec<&'static services::CuratedService>,
@@ -211,6 +268,7 @@ pub struct App {
     pub activity_state: TableState,
     pub modal: Option<Modal>,
     pub toast: Option<Toast>,
+    pub read_only: bool,
     pub should_quit: bool,
     tx: UnboundedSender<Msg>,
     rx: UnboundedReceiver<Msg>,
@@ -263,6 +321,19 @@ impl App {
                 generation: 0,
                 subview_index: 0,
             },
+            browse: BrowseState {
+                service: "dynamodb".to_string(),
+                operation: "ListTables".to_string(),
+                input: Value::Object(Default::default()),
+                table: None,
+                table_state: TableState::default(),
+                filter: None,
+                loading: false,
+                error: None,
+                status: None,
+                token: None,
+                generation: 0,
+            },
             console,
             emulator: EmulatorState { logs_offset: 0 },
             services: services::CURATED.iter().collect(),
@@ -271,6 +342,7 @@ impl App {
             activity_state: TableState::default(),
             modal: None,
             toast: None,
+            read_only: false,
             should_quit: false,
             tx,
             rx,
@@ -345,6 +417,139 @@ impl App {
         tokio::spawn(async move {
             let result = client.health().await;
             let _ = tx.send(Msg::Health(result));
+        });
+    }
+
+    fn spawn_doctor(&mut self) {
+        let client = self.client.clone();
+        let config = self.config.clone();
+        let statuses = self.service_status.clone();
+        let owned_pid = self.supervisor.pid();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let mut lines = vec!["AWS Emulator TUI — diagnostics".to_string(), String::new()];
+            let catalog = catalog::catalog();
+            let operations: usize = catalog
+                .services
+                .values()
+                .map(|service| service.ops.len())
+                .sum();
+            lines.push(format!(
+                "catalog        {} services · {} operations ({})",
+                catalog.len(),
+                operations,
+                catalog.source
+            ));
+            lines.push(format!("endpoint       {}", config.endpoint));
+            lines.push(format!("region         {}", config.region));
+
+            match client.health().await {
+                Ok(()) => lines.push("health         ok".to_string()),
+                Err(error) => lines.push(format!("health         FAILED — {error}")),
+            }
+            match services::caller_identity(&client).await {
+                Ok(identity) => lines.push(format!("identity       {identity}")),
+                Err(error) => lines.push(format!(
+                    "identity       FAILED — {} {}",
+                    error.status_label(),
+                    error.message
+                )),
+            }
+
+            lines.push(format!(
+                "credentials    {} ({})",
+                if config.paths.credentials.is_file() {
+                    "present"
+                } else {
+                    "missing"
+                },
+                config.credentials_source.label()
+            ));
+            lines.push(format!(
+                "config         {} ({})",
+                config.paths.config.display(),
+                exists(&config.paths.config)
+            ));
+            lines.push(format!(
+                "certificate    {} ({})",
+                config.paths.ca.display(),
+                exists(&config.paths.ca)
+            ));
+            lines.push(format!(
+                "state dir      {} ({})",
+                config.paths.directory.display(),
+                writable(&config.paths.directory)
+            ));
+            lines.push(format!(
+                "process        {}",
+                owned_pid
+                    .map(|pid| format!("pid {pid}, started by this TUI"))
+                    .unwrap_or_else(|| "external or not attached".to_string())
+            ));
+            lines.push(format!(
+                "binary         {}",
+                config
+                    .binary
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "not found".to_string())
+            ));
+            if let Some(binary) = &config.binary {
+                match tokio::process::Command::new(binary)
+                    .arg("-v")
+                    .output()
+                    .await
+                {
+                    Ok(output) => {
+                        let version = String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                        let version = if version.is_empty() {
+                            "no version output".to_string()
+                        } else {
+                            version
+                        };
+                        lines.push(format!("version        {version}"));
+                    }
+                    Err(error) => lines.push(format!("version        FAILED — {error}")),
+                }
+            }
+
+            let mut ok = 0;
+            let mut loading = 0;
+            let mut failed = Vec::new();
+            for (key, status) in &statuses {
+                match status {
+                    ServiceStatus::Ok => ok += 1,
+                    ServiceStatus::Loading => loading += 1,
+                    ServiceStatus::Err => failed.push(*key),
+                    ServiceStatus::Unknown => loading += 1,
+                }
+            }
+            lines.push(format!(
+                "probes         {ok} ok, {loading} pending, {} failed",
+                failed.len()
+            ));
+            if !failed.is_empty() {
+                lines.push(format!("failed         {}", failed.join(", ")));
+            }
+            if !config.warnings.is_empty() {
+                lines.push(String::new());
+                lines.push("warnings".to_string());
+                for warning in &config.warnings {
+                    lines.push(format!("  · {warning}"));
+                }
+            }
+            lines.push(String::new());
+            lines.push(
+                "Suggested fixes: start the emulator with `s` on the Emulator tab, or press `r` \
+                 there to reload the generated credentials and certificate."
+                    .to_string(),
+            );
+
+            let _ = tx.send(Msg::Doctor(lines.join("\n")));
         });
     }
 
@@ -471,6 +676,10 @@ impl App {
     }
 
     fn send_console_request(&mut self) {
+        if self.read_only && is_write_operation(&self.console.operation) {
+            self.toast(ToastKind::Info, "read-only mode blocks write operations");
+            return;
+        }
         if self.console.operation.is_empty() {
             self.toast(ToastKind::Error, "Pick an operation first (o)");
             return;
@@ -525,6 +734,13 @@ impl App {
                     self.spawn_probes();
                     self.load_table();
                 }
+            }
+            Msg::Doctor(report) => {
+                self.modal = Some(Modal::Text {
+                    title: "Diagnostics".to_string(),
+                    body: report,
+                    scroll: 0,
+                });
             }
             Msg::Identity(result) => match result {
                 Ok(identity) => self.identity = identity,
@@ -664,6 +880,162 @@ impl App {
                     self.load_table();
                 }
             }
+            Msg::Special {
+                service,
+                operation,
+                label,
+                request,
+                started,
+                result,
+            } => match result {
+                Ok(response) => {
+                    self.push_activity(activity_from_response(
+                        &service, &operation, request, started, &response,
+                    ));
+                    let body = format!(
+                        "{} · HTTP {} · {} ms\n\n{}",
+                        label,
+                        response.status,
+                        response.duration_ms,
+                        response.pretty()
+                    );
+                    self.modal = Some(Modal::Text {
+                        title: format!("{service}.{operation}"),
+                        body,
+                        scroll: 0,
+                    });
+                }
+                Err(error) => {
+                    self.push_activity(activity_from_error(
+                        &service, &operation, request, started, &error,
+                    ));
+                    self.toast(
+                        ToastKind::Error,
+                        format!("{label} failed: {}", first_line(&error.message)),
+                    );
+                }
+            },
+            Msg::S3Preview {
+                bucket,
+                key,
+                started,
+                result,
+            } => match result {
+                Ok(response) => {
+                    let content_type = response
+                        .headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, value)| value.clone())
+                        .unwrap_or_default();
+                    let printable = !response.body.is_empty()
+                        && response.body.chars().all(|character| {
+                            character == '\n'
+                                || character == '\r'
+                                || character == '\t'
+                                || !character.is_control()
+                        });
+                    let text = content_type.contains("text")
+                        || content_type.contains("json")
+                        || content_type.contains("xml")
+                        || content_type.is_empty()
+                        || printable;
+                    let body = if text {
+                        truncate(&response.body, 100_000)
+                    } else {
+                        format!(
+                            "Binary object ({} bytes, {content_type}).\n\nDownload it with the AWS CLI:\n\n  aws --endpoint-url {} s3api get-object --bucket {} --key {} <file>",
+                            response.body.len(),
+                            self.client.endpoint(),
+                            bucket,
+                            key
+                        )
+                    };
+                    let title = format!("{bucket}/{key}");
+                    self.push_activity(activity_from_response(
+                        "s3",
+                        "GetObject",
+                        format!("s3.GetObject\n{bucket}/{key}"),
+                        started,
+                        &response,
+                    ));
+                    self.modal = Some(Modal::Text {
+                        title,
+                        body,
+                        scroll: 0,
+                    });
+                }
+                Err(error) => {
+                    self.push_activity(activity_from_error(
+                        "s3",
+                        "GetObject",
+                        format!("s3.GetObject\n{bucket}/{key}"),
+                        started,
+                        &error,
+                    ));
+                    self.toast(
+                        ToastKind::Error,
+                        format!("preview failed: {}", first_line(&error.message)),
+                    );
+                }
+            },
+            Msg::Browse {
+                generation,
+                append,
+                service,
+                operation,
+                request,
+                started,
+                result,
+            } => {
+                if generation != self.browse.generation {
+                    return;
+                }
+                self.browse.loading = false;
+                match result {
+                    Ok((table, response)) => {
+                        self.browse.status = Some((response.status, response.duration_ms));
+                        self.browse.error = None;
+                        self.browse.token = table.token.clone();
+                        if append {
+                            if let Some(existing) = self.browse.table.as_mut() {
+                                for row in table.rows {
+                                    if !existing.rows.iter().any(|known| known.detail == row.detail)
+                                    {
+                                        existing.rows.push(row);
+                                    }
+                                }
+                                existing.token = table.token;
+                            } else {
+                                self.browse.table = Some(table);
+                            }
+                        } else {
+                            let count = table.rows.len();
+                            self.browse.table = Some(table);
+                            self.browse.table_state = TableState::default();
+                            if count > 0 {
+                                self.browse.table_state.select(Some(0));
+                            }
+                        }
+                        self.push_activity(activity_from_response(
+                            &service,
+                            &operation,
+                            request.clone(),
+                            started,
+                            &response,
+                        ));
+                    }
+                    Err(error) => {
+                        if !append {
+                            self.browse.table = None;
+                        }
+                        self.browse.error = Some(error.message.clone());
+                        self.push_activity(activity_from_error(
+                            &service, &operation, request, started, &error,
+                        ));
+                    }
+                }
+            }
             Msg::Console {
                 service,
                 operation,
@@ -768,6 +1140,15 @@ impl App {
             return;
         }
 
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+            self.open_palette();
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
+            self.export_current();
+            return;
+        }
+
         if let Some(modal) = self.modal.take() {
             self.handle_modal(modal, key).await;
             return;
@@ -780,6 +1161,14 @@ impl App {
             }
             KeyCode::Char('?') => {
                 self.modal = Some(Modal::Help { scroll: 0 });
+                return;
+            }
+            KeyCode::Char('D') => {
+                self.spawn_doctor();
+                return;
+            }
+            KeyCode::Char(':') => {
+                self.open_palette();
                 return;
             }
             KeyCode::Char('q') => {
@@ -799,23 +1188,34 @@ impl App {
                 return;
             }
             KeyCode::Char('2') => {
-                self.tab = Tab::Console;
+                self.tab = Tab::Browse;
+                self.ensure_browse_loaded();
                 return;
             }
             KeyCode::Char('3') => {
-                self.tab = Tab::Emulator;
+                self.tab = Tab::Console;
                 return;
             }
             KeyCode::Char('4') => {
+                self.tab = Tab::Emulator;
+                return;
+            }
+            KeyCode::Char('5') => {
                 self.tab = Tab::Requests;
                 return;
             }
             KeyCode::Tab => {
                 self.tab = self.tab.next();
+                if self.tab == Tab::Browse {
+                    self.ensure_browse_loaded();
+                }
                 return;
             }
             KeyCode::BackTab => {
                 self.tab = self.tab.previous();
+                if self.tab == Tab::Browse {
+                    self.ensure_browse_loaded();
+                }
                 return;
             }
             _ => {}
@@ -823,6 +1223,7 @@ impl App {
 
         match self.tab {
             Tab::Explorer => self.explorer_key(key).await,
+            Tab::Browse => self.browse_key(key).await,
             Tab::Console => self.console_key(key).await,
             Tab::Emulator => self.emulator_key(key).await,
             Tab::Requests => self.requests_key(key),
@@ -832,8 +1233,8 @@ impl App {
     async fn explorer_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                self.tab = Tab::Console;
-                self.open_service_picker();
+                self.tab = Tab::Browse;
+                self.open_service_picker(PickerAction::BrowseService);
                 return;
             }
             KeyCode::Char('h') | KeyCode::Left => {
@@ -881,6 +1282,7 @@ impl App {
                     self.explorer.table_state.select(Some(last));
                 }
                 KeyCode::Enter => self.inspect_selected(),
+                KeyCode::Char('o') => self.open_children(),
                 KeyCode::Esc => {
                     if self.explorer.show_detail {
                         self.explorer.show_detail = false;
@@ -892,6 +1294,7 @@ impl App {
                 }
                 KeyCode::Char('r') => self.load_table(),
                 KeyCode::Char('c') => self.open_create(),
+                KeyCode::Char('x') => self.open_special(),
                 KeyCode::Char('d') => self.confirm_delete(),
                 KeyCode::Char('/') => {
                     self.modal = Some(Modal::Input {
@@ -901,7 +1304,7 @@ impl App {
                         action: InputAction::Filter,
                     });
                 }
-                KeyCode::Char('x') => {
+                KeyCode::Char('X') => {
                     self.explorer.filter = None;
                     self.explorer.table_state = TableState::default();
                     if self
@@ -914,6 +1317,7 @@ impl App {
                     }
                 }
                 KeyCode::Char('v') => self.cycle_subview(),
+                KeyCode::Char('y') => self.copy_selected(),
                 KeyCode::PageDown => {
                     self.explorer.detail_scroll = self.explorer.detail_scroll.saturating_add(8);
                 }
@@ -952,8 +1356,11 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Char('s') => self.open_service_picker(),
-            KeyCode::Char('o') => self.open_operation_picker(),
+            KeyCode::Char('s') => self.open_service_picker(PickerAction::ConsoleService),
+            KeyCode::Char('o') => self.open_operation_picker(
+                PickerAction::ConsoleOperation,
+                &self.console.service.clone(),
+            ),
             KeyCode::Char('e') => self.console.focus_editor = true,
             KeyCode::Char('r') => {
                 self.reset_console_body();
@@ -969,55 +1376,61 @@ impl App {
         }
     }
 
+    async fn start_emulator(&mut self) {
+        if self.health.is_up() {
+            self.toast(
+                ToastKind::Info,
+                "emulator already running; this TUI is attached",
+            );
+            return;
+        }
+        match self.supervisor.start().await {
+            Ok(pid) => {
+                self.toast(ToastKind::Ok, format!("emulator started (pid {pid})"));
+                tokio::time::sleep(Duration::from_millis(1_200)).await;
+                self.reload_connection();
+                self.spawn_health();
+            }
+            Err(error) => self.toast(ToastKind::Error, error),
+        }
+    }
+
+    async fn stop_emulator(&mut self) {
+        if !self.supervisor.has_child() {
+            self.toast(
+                ToastKind::Info,
+                "no child process: the emulator was started outside this TUI",
+            );
+            return;
+        }
+        match self.supervisor.stop().await {
+            Ok(()) => {
+                self.health = Health::Down("stopped by user".to_string());
+                self.toast(ToastKind::Ok, "emulator stopped");
+            }
+            Err(error) => self.toast(ToastKind::Error, error),
+        }
+    }
+
+    async fn restart_emulator(&mut self) {
+        let _ = self.supervisor.stop().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        match self.supervisor.start().await {
+            Ok(pid) => {
+                self.toast(ToastKind::Ok, format!("emulator restarted (pid {pid})"));
+                tokio::time::sleep(Duration::from_millis(1_200)).await;
+                self.reload_connection();
+                self.spawn_health();
+            }
+            Err(error) => self.toast(ToastKind::Error, error),
+        }
+    }
+
     async fn emulator_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('s') => {
-                if self.health.is_up() {
-                    self.toast(
-                        ToastKind::Info,
-                        "emulator already running; this TUI is attached",
-                    );
-                    return;
-                }
-                match self.supervisor.start().await {
-                    Ok(pid) => {
-                        self.toast(ToastKind::Ok, format!("emulator started (pid {pid})"));
-                        tokio::time::sleep(Duration::from_millis(1_200)).await;
-                        self.reload_connection();
-                        self.spawn_health();
-                    }
-                    Err(error) => self.toast(ToastKind::Error, error),
-                }
-            }
-            KeyCode::Char('x') => {
-                if !self.supervisor.has_child() {
-                    self.toast(
-                        ToastKind::Info,
-                        "no child process: the emulator was started outside this TUI",
-                    );
-                    return;
-                }
-                match self.supervisor.stop().await {
-                    Ok(()) => {
-                        self.health = Health::Down("stopped by user".to_string());
-                        self.toast(ToastKind::Ok, "emulator stopped");
-                    }
-                    Err(error) => self.toast(ToastKind::Error, error),
-                }
-            }
-            KeyCode::Char('R') => {
-                let _ = self.supervisor.stop().await;
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                match self.supervisor.start().await {
-                    Ok(pid) => {
-                        self.toast(ToastKind::Ok, format!("emulator restarted (pid {pid})"));
-                        tokio::time::sleep(Duration::from_millis(1_200)).await;
-                        self.reload_connection();
-                        self.spawn_health();
-                    }
-                    Err(error) => self.toast(ToastKind::Error, error),
-                }
-            }
+            KeyCode::Char('s') => self.start_emulator().await,
+            KeyCode::Char('x') => self.stop_emulator().await,
+            KeyCode::Char('R') => self.restart_emulator().await,
             KeyCode::Char('r') => {
                 self.reload_connection();
                 self.spawn_health();
@@ -1189,6 +1602,13 @@ impl App {
                         InputAction::CreateName(view) => {
                             self.submit_create(view, serde_json::json!({"name": value}));
                         }
+                        InputAction::BrowseFilter => {
+                            self.browse.filter = if value.is_empty() { None } else { Some(value) };
+                            self.browse.table_state = TableState::default();
+                            if !self.browse.visible_rows().is_empty() {
+                                self.browse.table_state.select(Some(0));
+                            }
+                        }
                     }
                 }
                 _ => {
@@ -1215,6 +1635,24 @@ impl App {
                             self.modal = None;
                             match action {
                                 JsonAction::CreateJson(view) => self.submit_create(view, input),
+                                JsonAction::BrowseRun => {
+                                    self.browse.input = input;
+                                    self.load_browse(false);
+                                }
+                                JsonAction::RunSpecial {
+                                    service,
+                                    operation,
+                                    label,
+                                } => {
+                                    if self.read_only && is_write_operation(&operation) {
+                                        self.toast(
+                                            ToastKind::Info,
+                                            "read-only mode blocks write operations",
+                                        );
+                                    } else {
+                                        self.spawn_special(service, operation, label, input);
+                                    }
+                                }
                             }
                         }
                         Err(error) => {
@@ -1312,13 +1750,66 @@ impl App {
                                 self.console.response.clear();
                                 self.console.error = None;
                                 self.console.status = None;
-                                self.open_operation_picker();
+                                self.open_operation_picker(PickerAction::ConsoleOperation, &key);
                             }
                             PickerAction::ConsoleOperation => {
                                 self.console.operation = key.clone();
                                 self.console.error = None;
                                 self.console.status = None;
                                 self.reset_console_body();
+                            }
+                            PickerAction::BrowseService => {
+                                self.browse.service = key.clone();
+                                self.browse.operation.clear();
+                                self.browse.table = None;
+                                self.browse.token = None;
+                                self.browse.error = None;
+                                self.browse.status = None;
+                                self.open_operation_picker(PickerAction::BrowseOperation, &key);
+                            }
+                            PickerAction::Palette => {
+                                self.run_palette(&key).await;
+                            }
+                            PickerAction::SwitchEndpoint => {
+                                if self.supervisor.has_child() {
+                                    self.toast(
+                                        ToastKind::Info,
+                                        "stop the TUI-started emulator before switching endpoints",
+                                    );
+                                    return;
+                                }
+                                std::env::set_var("EMULATOR_ENDPOINT", &key);
+                                self.reload_connection();
+                                self.supervisor =
+                                    Supervisor::new(self.config.binary.clone(), self.config.port());
+                                self.explorer.table = None;
+                                self.explorer.error = None;
+                                self.explorer.generation += 1;
+                                self.browse.table = None;
+                                self.browse.token = None;
+                                self.browse.error = None;
+                                self.browse.generation += 1;
+                                self.spawn_health();
+                                self.spawn_identity();
+                                self.spawn_probes();
+                                self.load_table();
+                                if self.tab == Tab::Browse {
+                                    self.ensure_browse_loaded();
+                                }
+                                self.toast(ToastKind::Ok, format!("switched to {key}"));
+                            }
+                            PickerAction::BrowseOperation => {
+                                self.browse.operation = key.clone();
+                                self.browse.table = None;
+                                self.browse.token = None;
+                                self.browse.error = None;
+                                self.browse.status = None;
+                                let input = catalog::catalog()
+                                    .get(&self.browse.service)
+                                    .and_then(|service| service.operation(&key))
+                                    .map(|op| op.skel.clone())
+                                    .unwrap_or_else(|| Value::Object(Default::default()));
+                                self.open_browse_editor(input);
                             }
                         }
                     }
@@ -1391,6 +1882,9 @@ impl App {
             ViewId::S3Buckets => {
                 self.open_view(ViewId::S3Objects(id));
             }
+            ViewId::S3Objects(bucket) => {
+                self.spawn_s3_preview(bucket, id);
+            }
             _ => {
                 if services::describe_call(&view, &id).is_some() {
                     self.spawn_detail(view, id);
@@ -1406,7 +1900,96 @@ impl App {
         }
     }
 
+    fn open_children(&mut self) {
+        let Some(row) = self.explorer.selected_row() else {
+            return;
+        };
+        let view = self.explorer.view.clone();
+        let id = row.id.clone();
+        if let ViewId::S3Buckets = view {
+            self.open_view(ViewId::S3Objects(id));
+            return;
+        }
+        if let Some((service, operation, input)) = services::drilldown(&view, &id) {
+            self.open_browse(service, operation, input);
+        } else {
+            self.toast(
+                ToastKind::Info,
+                format!("{} has no child collection for this row", view.title()),
+            );
+        }
+    }
+
+    fn open_special(&mut self) {
+        if self.read_only {
+            self.toast(ToastKind::Info, "read-only mode is on");
+            return;
+        }
+        let Some(row) = self.explorer.selected_row() else {
+            return;
+        };
+        let view = self.explorer.view.clone();
+        let id = row.id.clone();
+        let Some(action) = services::special_action(&view, &id) else {
+            self.toast(
+                ToastKind::Info,
+                format!("{} has no extra action for this row", view.title()),
+            );
+            return;
+        };
+        let text = pretty_json(&action.template);
+        let textarea = TextArea::new(text.lines().map(str::to_string).collect());
+        self.modal = Some(Modal::Json {
+            title: action.title.to_string(),
+            textarea: Box::new(textarea),
+            action: JsonAction::RunSpecial {
+                service: action.service.to_string(),
+                operation: action.operation.to_string(),
+                label: action.title.to_string(),
+            },
+            error: None,
+        });
+    }
+
+    fn spawn_special(&mut self, service: String, operation: String, label: String, input: Value) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        let started = Instant::now();
+        let request = format!("{service}.{operation}\n{}", pretty_json(&input));
+        tokio::spawn(async move {
+            let result = client.call(&service, &operation, input).await;
+            let _ = tx.send(Msg::Special {
+                service,
+                operation,
+                label,
+                request,
+                started,
+                result,
+            });
+        });
+    }
+
+    fn spawn_s3_preview(&mut self, bucket: String, key: String) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        let started = Instant::now();
+        let path = format!("/{}/{}", sigv4::encode(&bucket), sigv4::encode_path(&key));
+        tokio::spawn(async move {
+            let result = client.s3("GET", &path, "", Vec::new()).await;
+            let _ = tx.send(Msg::S3Preview {
+                bucket,
+                key,
+                started,
+                result,
+            });
+        });
+    }
+
     fn open_create(&mut self) {
+        if self.read_only {
+            self.toast(ToastKind::Info, "read-only mode is on");
+            return;
+        }
         let view = self.explorer.view.clone();
         match services::create_kind(&view) {
             Some(CreateKind::Name { title, placeholder }) => {
@@ -1435,6 +2018,10 @@ impl App {
     }
 
     fn confirm_delete(&mut self) {
+        if self.read_only {
+            self.toast(ToastKind::Info, "read-only mode is on");
+            return;
+        }
         let Some(row) = self.explorer.selected_row() else {
             return;
         };
@@ -1476,7 +2063,7 @@ impl App {
         self.console.scroll = 0;
     }
 
-    fn open_service_picker(&mut self) {
+    fn open_service_picker(&mut self, action: PickerAction) {
         let catalog = catalog::catalog();
         let all: Vec<(String, String)> = catalog
             .ordered_keys()
@@ -1496,29 +2083,439 @@ impl App {
             filter: Input::default(),
             all,
             state,
-            action: PickerAction::ConsoleService,
+            action,
         });
     }
 
-    fn open_operation_picker(&mut self) {
-        let Some(service) = catalog::catalog().get(&self.console.service) else {
+    fn open_operation_picker(&mut self, action: PickerAction, service_key: &str) {
+        let Some(service) = catalog::catalog().get(service_key) else {
             self.toast(ToastKind::Error, "unknown service");
             return;
         };
-        let all: Vec<(String, String)> = service
-            .ops
-            .keys()
-            .map(|name| (name.clone(), name.clone()))
+        let mut names: Vec<String> = service.ops.keys().cloned().collect();
+        if matches!(action, PickerAction::BrowseOperation) {
+            names.sort_by_key(|name| (operation_rank(name), name.clone()));
+        }
+        let all: Vec<(String, String)> = names
+            .into_iter()
+            .map(|name| {
+                let marker = if operation_rank(&name) == 0 {
+                    "▸"
+                } else {
+                    " "
+                };
+                let label = format!("{marker} {name}");
+                (name, label)
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(0));
+        let title = if matches!(action, PickerAction::BrowseOperation) {
+            format!("{service_key} operations ({}) — list-like first", all.len())
+        } else {
+            format!("{service_key} operations ({})", all.len())
+        };
+        self.modal = Some(Modal::Picker {
+            title,
+            filter: Input::default(),
+            all,
+            state,
+            action,
+        });
+    }
+
+    fn ensure_browse_loaded(&mut self) {
+        if self.browse.table.is_none()
+            && self.browse.error.is_none()
+            && !self.browse.loading
+            && self.health.is_up()
+            && !self.browse.operation.is_empty()
+        {
+            self.load_browse(false);
+        }
+    }
+
+    fn open_browse(&mut self, service: &str, operation: &str, input: Value) {
+        self.tab = Tab::Browse;
+        self.browse.service = service.to_string();
+        self.browse.operation = operation.to_string();
+        self.browse.input = input;
+        self.browse.table = None;
+        self.browse.token = None;
+        self.browse.error = None;
+        self.browse.status = None;
+        self.browse.filter = None;
+        self.browse.generation += 1;
+        self.load_browse(false);
+    }
+
+    fn load_browse(&mut self, append: bool) {
+        if self.read_only && !append && is_write_operation(&self.browse.operation) {
+            self.toast(ToastKind::Info, "read-only mode blocks write operations");
+            return;
+        }
+        if self.browse.operation.is_empty() {
+            self.toast(ToastKind::Info, "Pick an operation first (o)");
+            return;
+        }
+        if append && self.browse.token.is_none() {
+            self.toast(ToastKind::Info, "No more pages");
+            return;
+        }
+        let input = if append {
+            self.browse
+                .token
+                .as_ref()
+                .map(|token| token.next_input(&self.browse.input))
+                .unwrap_or_else(|| self.browse.input.clone())
+        } else {
+            self.browse.input.clone()
+        };
+        self.browse.generation += 1;
+        let generation = self.browse.generation;
+        self.browse.loading = true;
+        self.browse.error = None;
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        let service = self.browse.service.clone();
+        let operation = self.browse.operation.clone();
+        let request = format!("{service}.{operation}\n{}", pretty_json(&input));
+        let started = Instant::now();
+        tokio::spawn(async move {
+            let result = generic::fetch(&client, &service, &operation, input).await;
+            let _ = tx.send(Msg::Browse {
+                generation,
+                append,
+                service,
+                operation,
+                request,
+                started,
+                result,
+            });
+        });
+    }
+
+    fn open_browse_editor(&mut self, input: Value) {
+        let text = pretty_json(&input);
+        let textarea = TextArea::new(text.lines().map(str::to_string).collect());
+        self.modal = Some(Modal::Json {
+            title: format!("Input — {}.{}", self.browse.service, self.browse.operation),
+            textarea: Box::new(textarea),
+            action: JsonAction::BrowseRun,
+            error: None,
+        });
+    }
+
+    async fn browse_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('s') => self.open_service_picker(PickerAction::BrowseService),
+            KeyCode::Char('o') => self
+                .open_operation_picker(PickerAction::BrowseOperation, &self.browse.service.clone()),
+            KeyCode::Char('e') => {
+                let input = self.browse.input.clone();
+                self.open_browse_editor(input);
+            }
+            KeyCode::Char('r') => self.load_browse(false),
+            KeyCode::Char('m') => self.load_browse(true),
+            KeyCode::Enter => self.show_browse_detail(),
+            KeyCode::Char('/') => {
+                self.modal = Some(Modal::Input {
+                    title: "Filter".to_string(),
+                    prompt: "Show rows containing".to_string(),
+                    input: Input::new(self.browse.filter.clone().unwrap_or_default()),
+                    action: InputAction::BrowseFilter,
+                });
+            }
+            KeyCode::Char('x') => {
+                self.browse.filter = None;
+                self.browse.table_state = TableState::default();
+                if !self.browse.visible_rows().is_empty() {
+                    self.browse.table_state.select(Some(0));
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let len = self.browse.visible_rows().len();
+                if len > 0 {
+                    let current = self.browse.table_state.selected().unwrap_or(0);
+                    self.browse
+                        .table_state
+                        .select(Some((current + 1).min(len - 1)));
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                let current = self.browse.table_state.selected().unwrap_or(0);
+                self.browse
+                    .table_state
+                    .select(Some(current.saturating_sub(1)));
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.browse.table_state.select(Some(0));
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                let last = self.browse.visible_rows().len().saturating_sub(1);
+                self.browse.table_state.select(Some(last));
+            }
+            KeyCode::Char('y') => self.copy_selected(),
+            KeyCode::Esc => self.tab = Tab::Explorer,
+            _ => {}
+        }
+    }
+
+    fn open_palette(&mut self) {
+        let read_only = if self.read_only { "on" } else { "off" };
+        let entries = vec![
+            ("tab.explorer", "Go to Explorer".to_string()),
+            ("tab.browse", "Browse all services".to_string()),
+            ("tab.console", "Open the API console".to_string()),
+            ("tab.emulator", "Emulator lifecycle and logs".to_string()),
+            ("tab.requests", "Request history".to_string()),
+            ("diag", "Run diagnostics".to_string()),
+            (
+                "readonly",
+                format!("Toggle read-only mode (currently {read_only})"),
+            ),
+            ("export", "Export the current table to JSON".to_string()),
+            ("copy", "Copy the selected row (OSC52)".to_string()),
+            ("endpoint", "Switch emulator endpoint".to_string()),
+            ("start", "Start the emulator".to_string()),
+            ("stop", "Stop the emulator".to_string()),
+            ("restart", "Restart the emulator".to_string()),
+            ("help", "Help".to_string()),
+            ("quit", "Quit".to_string()),
+        ];
+        let all: Vec<(String, String)> = entries
+            .into_iter()
+            .map(|(key, label)| (key.to_string(), label))
             .collect();
         let mut state = ListState::default();
         state.select(Some(0));
         self.modal = Some(Modal::Picker {
-            title: format!("{} operations ({})", self.console.service, all.len()),
+            title: "Command palette — type to filter".to_string(),
             filter: Input::default(),
             all,
             state,
-            action: PickerAction::ConsoleOperation,
+            action: PickerAction::Palette,
         });
+    }
+
+    async fn run_palette(&mut self, key: &str) {
+        match key {
+            "tab.explorer" => self.tab = Tab::Explorer,
+            "tab.browse" => {
+                self.tab = Tab::Browse;
+                self.ensure_browse_loaded();
+            }
+            "tab.console" => self.tab = Tab::Console,
+            "tab.emulator" => self.tab = Tab::Emulator,
+            "tab.requests" => self.tab = Tab::Requests,
+            "diag" => self.spawn_doctor(),
+            "readonly" => {
+                self.read_only = !self.read_only;
+                let state = if self.read_only { "on" } else { "off" };
+                self.toast(ToastKind::Info, format!("read-only mode {state}"));
+            }
+            "export" => self.export_current(),
+            "copy" => self.copy_selected(),
+            "endpoint" => self.open_endpoint_picker(),
+            "start" => self.start_emulator().await,
+            "stop" => self.stop_emulator().await,
+            "restart" => self.restart_emulator().await,
+            "help" => self.modal = Some(Modal::Help { scroll: 0 }),
+            "quit" => {
+                if self.supervisor.has_child() {
+                    self.modal = Some(Modal::Confirm {
+                        title: "Quit".to_string(),
+                        message: "This TUI started the emulator. Quit and stop it?".to_string(),
+                        action: ConfirmAction::Quit,
+                    });
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn open_endpoint_picker(&mut self) {
+        let endpoints = config::discovered_endpoints();
+        if endpoints.is_empty() {
+            self.toast(ToastKind::Info, "no emulators found under ~/.aws/emulator");
+            return;
+        }
+        let all: Vec<(String, String)> = endpoints
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint.endpoint.clone(),
+                    format!(
+                        "port {:<5} {}  ·  {}",
+                        endpoint.port, endpoint.endpoint, endpoint.region
+                    ),
+                )
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(0));
+        self.modal = Some(Modal::Picker {
+            title: format!("Emulator endpoints ({})", all.len()),
+            filter: Input::default(),
+            all,
+            state,
+            action: PickerAction::SwitchEndpoint,
+        });
+    }
+
+    fn export_current(&mut self) {
+        let (view, columns, rows): (String, Vec<String>, Vec<Value>) = match self.tab {
+            Tab::Explorer => {
+                let Some(table) = &self.explorer.table else {
+                    self.toast(ToastKind::Info, "nothing to export on this screen");
+                    return;
+                };
+                let rows = self
+                    .explorer
+                    .visible_rows()
+                    .iter()
+                    .map(|row| {
+                        json!({
+                            "id": row.id,
+                            "cells": row.cells,
+                            "detail": row.detail,
+                        })
+                    })
+                    .collect();
+                (
+                    format!(
+                        "{} · {}",
+                        self.explorer.view.service_key(),
+                        self.explorer.view.title()
+                    ),
+                    table
+                        .columns
+                        .iter()
+                        .map(|column| column.to_string())
+                        .collect(),
+                    rows,
+                )
+            }
+            Tab::Browse => {
+                let Some(table) = &self.browse.table else {
+                    self.toast(ToastKind::Info, "nothing to export on this screen");
+                    return;
+                };
+                let rows = self
+                    .browse
+                    .visible_rows()
+                    .iter()
+                    .map(|row| row.detail.clone())
+                    .collect();
+                (
+                    format!("{}.{}", self.browse.service, self.browse.operation),
+                    table.columns.clone(),
+                    rows,
+                )
+            }
+            _ => {
+                self.toast(
+                    ToastKind::Info,
+                    "open a table in Explorer or Browse before exporting",
+                );
+                return;
+            }
+        };
+        if rows.is_empty() {
+            self.toast(ToastKind::Info, "the current table has no rows");
+            return;
+        }
+        let stamp = emu_core::sigv4::amz_date(SystemTime::now());
+        let stamp = &stamp[..15];
+        let directory = dirs::data_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("emutui")
+            .join("exports");
+        if let Err(error) = std::fs::create_dir_all(&directory) {
+            self.toast(
+                ToastKind::Error,
+                format!("cannot create export dir: {error}"),
+            );
+            return;
+        }
+        let safe = view
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        let path = directory.join(format!("{safe}-{stamp}.json"));
+        let count = rows.len();
+        let payload = json!({
+            "generated_by": "emutui",
+            "view": view,
+            "columns": columns,
+            "rows": rows,
+            "row_count": count,
+        });
+        match std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&payload).unwrap_or_default(),
+        ) {
+            Ok(()) => self.toast(ToastKind::Ok, format!("exported to {}", path.display())),
+            Err(error) => self.toast(ToastKind::Error, format!("export failed: {error}")),
+        }
+    }
+
+    fn copy_selected(&mut self) {
+        let text = match self.tab {
+            Tab::Explorer => self.explorer.selected_row().map(|row| {
+                row.detail
+                    .as_ref()
+                    .map(pretty_json)
+                    .unwrap_or_else(|| row.id.clone())
+            }),
+            Tab::Browse => self
+                .browse
+                .selected_row()
+                .map(|row| pretty_json(&row.detail)),
+            _ => None,
+        };
+        let Some(text) = text else {
+            self.toast(ToastKind::Info, "select a row first");
+            return;
+        };
+        copy_osc52(&text);
+        self.toast(
+            ToastKind::Ok,
+            format!("copied {} bytes with OSC52", text.len()),
+        );
+    }
+
+    fn show_browse_detail(&mut self) {
+        let Some(row) = self.browse.selected_row() else {
+            return;
+        };
+        self.modal = Some(Modal::Text {
+            title: format!("{}.{}", self.browse.service, self.browse.operation),
+            body: pretty_json(&row.detail),
+            scroll: 0,
+        });
+    }
+}
+
+fn operation_rank(name: &str) -> u8 {
+    if name.starts_with("List") {
+        0
+    } else if name.starts_with("Describe")
+        || name.starts_with("Get")
+        || name.starts_with("Search")
+        || name.starts_with("Scan")
+    {
+        1
+    } else {
+        2
     }
 }
 
@@ -1526,6 +2523,7 @@ impl App {
 
 pub enum Msg {
     Health(Result<(), String>),
+    Doctor(String),
     Identity(Result<String, ApiError>),
     Probed {
         key: &'static str,
@@ -1561,6 +2559,29 @@ pub enum Msg {
         request: String,
         started: Instant,
         result: Result<ApiResponse, ApiError>,
+    },
+    Special {
+        service: String,
+        operation: String,
+        label: String,
+        request: String,
+        started: Instant,
+        result: Result<ApiResponse, ApiError>,
+    },
+    S3Preview {
+        bucket: String,
+        key: String,
+        started: Instant,
+        result: Result<ApiResponse, ApiError>,
+    },
+    Browse {
+        generation: u64,
+        append: bool,
+        service: String,
+        operation: String,
+        request: String,
+        started: Instant,
+        result: Result<(GenericTable, ApiResponse), ApiError>,
     },
 }
 
@@ -1601,11 +2622,18 @@ pub enum Modal {
 
 pub enum InputAction {
     Filter,
+    BrowseFilter,
     CreateName(ViewId),
 }
 
 pub enum JsonAction {
     CreateJson(ViewId),
+    BrowseRun,
+    RunSpecial {
+        service: String,
+        operation: String,
+        label: String,
+    },
 }
 
 pub enum ConfirmAction {
@@ -1617,6 +2645,10 @@ pub enum ConfirmAction {
 pub enum PickerAction {
     ConsoleService,
     ConsoleOperation,
+    BrowseService,
+    BrowseOperation,
+    Palette,
+    SwitchEndpoint,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1782,6 +2814,90 @@ fn truncate(text: &str, limit: usize) -> String {
         end -= 1;
     }
     format!("{}…", &text[..end])
+}
+
+fn copy_osc52(text: &str) {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]52;c;{encoded}\x07");
+    let _ = out.flush();
+}
+
+fn is_write_operation(name: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "Create",
+        "Put",
+        "Delete",
+        "Update",
+        "Start",
+        "Stop",
+        "Terminate",
+        "Modify",
+        "Attach",
+        "Detach",
+        "Set",
+        "Remove",
+        "Revoke",
+        "Authorize",
+        "Send",
+        "Publish",
+        "Purge",
+        "Execute",
+        "Run",
+        "Invoke",
+        "Import",
+        "Restore",
+        "Cancel",
+        "Register",
+        "Deregister",
+        "Associate",
+        "Disassociate",
+        "Enable",
+        "Disable",
+        "Reboot",
+        "Reset",
+        "Tag",
+        "Untag",
+        "Copy",
+        "Upload",
+        "Complete",
+        "Abort",
+        "Add",
+        "Apply",
+        "Accept",
+        "Reject",
+        "Batch",
+        "Provision",
+        "Allocate",
+        "Release",
+        "Replace",
+        "Rotate",
+        "Schedule",
+    ];
+    PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+}
+
+fn exists(path: &std::path::Path) -> &'static str {
+    if path.exists() {
+        "exists"
+    } else {
+        "missing"
+    }
+}
+
+fn writable(path: &std::path::Path) -> &'static str {
+    if !path.is_dir() {
+        return "missing";
+    }
+    let probe = path.join(".emutui-write-test");
+    match std::fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            "writable"
+        }
+        Err(_) => "not writable",
+    }
 }
 
 impl Default for ExplorerState {

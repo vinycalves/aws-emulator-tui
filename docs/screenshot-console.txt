@@ -1,6 +1,6 @@
  AWS EMULATOR TUI │ https://127.0.0.1:9297  ● healthy  │ us-east-1  │ 000000000000 · arn:aws:iam::000000000000:user/emulator
- 1 Explorer   2 Console   3 Emulator   4 Requests    tab switch · ? help · q quit
- service sqs  op ListQueues  protocol json  s service · o operation · e edit · ctrl+s send  HTTP 200 · 3 ms
+ 1 Explorer   2 Browse   3 Console   4 Emulator   5 Requests    tab switch · ? help · q quit
+ service sqs  op ListQueues  protocol json  s service · o operation · e edit · ctrl+s send  HTTP 200 · 4 ms
 ┌ request · editing ────────────────────────────────────────────────┐┌ response ─────────────────────────────────────────────────────────────────────┐
 │{}                                                                 ││{                                                                              │
 │                                                                   ││  "QueueUrls": [                                                               │

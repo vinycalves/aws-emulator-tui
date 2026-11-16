@@ -13,6 +13,7 @@
 pub mod catalog;
 pub mod client;
 pub mod config;
+pub mod generic;
 pub mod services;
 pub mod sigv4;
 pub mod supervisor;

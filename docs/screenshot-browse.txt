@@ -1,0 +1,42 @@
+ AWS EMULATOR TUI │ https://127.0.0.1:9297  ● healthy  │ us-east-1  │ 000000000000 · arn:aws:iam::000000000000:user/emulator
+ 1 Explorer   2 Browse   3 Console   4 Emulator   5 Requests    tab switch · ? help · q quit
+ service dynamodb  op Scan  rows 2  HTTP 200 · 3 ms   s service · o operation · e input · r run · m more · enter detail
+┌ dynamodb.Scan ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ID           STATUS    TOTAL                                                                                                                        │
+│order-1001   SHIPPED   42.5                                                                                                                         │
+│order-1002   PENDING   9.9                                                                                                                          │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ s service · o operation · e input · r run · m next page · enter detail · / filter · y copy · esc explorer

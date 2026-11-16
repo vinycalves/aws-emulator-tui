@@ -357,15 +357,21 @@ pub async fn fetch(client: &EmulatorClient, view: &ViewId) -> Result<Table, ApiE
         }
         ViewId::SnsTopics => {
             let response = client.call("sns", "ListTopics", json!({})).await?;
-            let rows = json_array(&response, "Topics")
-                .iter()
+            let document = xml::parse(&response.body)
+                .ok_or_else(|| ApiError::transport("SNS did not return XML"))?;
+            let nodes = xml::path(
+                document.root_element(),
+                &["ListTopicsResult", "Topics", "member"],
+            );
+            let rows = nodes
+                .into_iter()
                 .map(|topic| {
-                    let arn = get_str(topic, "TopicArn");
+                    let arn = xml::field(topic, "TopicArn");
                     let name = arn.rsplit(':').next().unwrap_or(&arn).to_string();
                     Row {
                         id: arn.clone(),
                         cells: vec![name, arn.clone()],
-                        detail: Some(topic.clone()),
+                        detail: Some(xml::node_to_json(topic)),
                     }
                 })
                 .collect();
@@ -696,6 +702,86 @@ pub fn describe_call(view: &ViewId, id: &str) -> Option<(&'static str, &'static 
             json!({"stateMachineArn": id}),
         ),
         ViewId::S3Buckets | ViewId::S3Objects(_) => return None,
+    })
+}
+
+/// A child collection reachable from a row, for the generic browser.
+pub fn drilldown(view: &ViewId, id: &str) -> Option<(&'static str, &'static str, Value)> {
+    Some(match view {
+        ViewId::DynamoDbTables => ("dynamodb", "Scan", json!({"TableName": id})),
+        ViewId::SqsQueues => (
+            "sqs",
+            "ReceiveMessage",
+            json!({"QueueUrl": id, "MaxNumberOfMessages": 10, "VisibilityTimeout": 0}),
+        ),
+        ViewId::SnsTopics => ("sns", "ListSubscriptionsByTopic", json!({"TopicArn": id})),
+        ViewId::LambdaFunctions => (
+            "lambda",
+            "ListEventSourceMappings",
+            json!({"FunctionName": id}),
+        ),
+        ViewId::IamUsers => ("iam", "ListAttachedUserPolicies", json!({"UserName": id})),
+        ViewId::IamRoles => ("iam", "ListAttachedRolePolicies", json!({"RoleName": id})),
+        ViewId::CfnStacks => (
+            "cloudformation",
+            "DescribeStackResources",
+            json!({"StackName": id}),
+        ),
+        ViewId::LogGroups => ("logs", "DescribeLogStreams", json!({"logGroupName": id})),
+        ViewId::EventBuses => ("events", "ListRules", json!({"EventBusName": id})),
+        ViewId::EcsClusters => ("ecs", "ListServices", json!({"cluster": id})),
+        ViewId::EcrRepositories => ("ecr", "DescribeImages", json!({"repositoryName": id})),
+        ViewId::KmsKeys => ("kms", "ListGrants", json!({"KeyId": id})),
+        ViewId::StateMachines => (
+            "stepfunctions",
+            "ListExecutions",
+            json!({"stateMachineArn": id}),
+        ),
+        ViewId::S3Buckets
+        | ViewId::S3Objects(_)
+        | ViewId::Ec2Instances
+        | ViewId::Secrets
+        | ViewId::SsmParameters => return None,
+    })
+}
+
+/// A service-specific action offered on a row (send, publish, invoke, start).
+#[derive(Clone, Debug)]
+pub struct SpecialAction {
+    pub title: &'static str,
+    pub service: &'static str,
+    pub operation: &'static str,
+    pub template: Value,
+}
+
+/// The extra action available for a row, when one exists.
+pub fn special_action(view: &ViewId, id: &str) -> Option<SpecialAction> {
+    Some(match view {
+        ViewId::SqsQueues => SpecialAction {
+            title: "Send message",
+            service: "sqs",
+            operation: "SendMessage",
+            template: json!({"QueueUrl": id, "MessageBody": ""}),
+        },
+        ViewId::SnsTopics => SpecialAction {
+            title: "Publish message",
+            service: "sns",
+            operation: "Publish",
+            template: json!({"TopicArn": id, "Message": ""}),
+        },
+        ViewId::LambdaFunctions => SpecialAction {
+            title: "Invoke function",
+            service: "lambda",
+            operation: "Invoke",
+            template: json!({"FunctionName": id, "Payload": {}}),
+        },
+        ViewId::StateMachines => SpecialAction {
+            title: "Start execution",
+            service: "stepfunctions",
+            operation: "StartExecution",
+            template: json!({"stateMachineArn": id, "input": "{}"}),
+        },
+        _ => return None,
     })
 }
 
@@ -1120,6 +1206,19 @@ mod tests {
     #[test]
     fn formats_milliseconds() {
         assert_eq!(format_epoch_ms(0), "1970-01-01 00:00");
+    }
+
+    #[test]
+    fn exposes_drilldowns_and_row_actions() {
+        assert!(drilldown(&ViewId::DynamoDbTables, "orders").is_some());
+        assert!(drilldown(&ViewId::CfnStacks, "stack").is_some());
+        assert!(drilldown(&ViewId::Ec2Instances, "i-1").is_none());
+
+        let send = special_action(&ViewId::SqsQueues, "queue-url").expect("SQS send");
+        assert_eq!(send.operation, "SendMessage");
+        let invoke = special_action(&ViewId::LambdaFunctions, "fn").expect("Lambda invoke");
+        assert_eq!(invoke.operation, "Invoke");
+        assert!(special_action(&ViewId::IamUsers, "alice").is_none());
     }
 
     #[test]

@@ -1,6 +1,6 @@
  AWS EMULATOR TUI │ https://127.0.0.1:9297  ● healthy  │ us-east-1  │ 000000000000 · arn:aws:iam::000000000000:user/emulator
- 1 Explorer   2 Console   3 Emulator   4 Requests    tab switch · ? help · q quit
-┌ SERVICES ──────────────┐DynamoDB › Tables  (1 row)   enter inspect · c create · d delete · / filter
+ 1 Explorer   2 Browse   3 Console   4 Emulator   5 Requests    tab switch · ? help · q quit
+┌ SERVICES ──────────────┐DynamoDB › Tables  (1 row)   enter inspect · o children · x action · c create · d delete · / filter
 │ STORAGE                │┌ Tables ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ S3              ●      ││TABLE                                                                                                                     │
 │ DATABASES              ││orders                                                                                                                    │
@@ -39,4 +39,4 @@
 │                        ││        "AttributeName": "id",                                                                                            │
 │                        ││        "KeyType": "HASH"                                                                                                 │
 └─────── a  all services ┘└──────────────────────────────────────────────────────────────────────────────────────────── esc close · PgUp/PgDn scroll ┘
- ↑↓ row · enter inspect · c create · d delete · / filter · v subview · esc back · ? help
+ ↑↓ row · enter inspect · o children · x action · c create · d delete · y copy · ctrl+p palette

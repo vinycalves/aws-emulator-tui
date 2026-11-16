@@ -274,7 +274,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "emu-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -294,10 +294,12 @@ dependencies = [
 
 [[package]]
 name = "emu-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "crossterm",
+ "dirs",
  "emu-core",
  "ratatui",
  "serde_json",

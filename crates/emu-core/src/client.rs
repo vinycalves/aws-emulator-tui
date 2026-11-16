@@ -141,7 +141,7 @@ impl EmulatorClient {
             }
             "rest-json" => self.call_rest(service, op, operation, input).await,
             "rest-xml" => Err(ApiError::transport(format!(
-                "`{service_key}` is a REST-XML service; use the S3 actions or the raw console"
+                "`{service_key}` uses REST-XML, which this TUI does not shape yet. S3 is handled by its dedicated screens."
             ))),
             other => Err(ApiError::transport(format!(
                 "unsupported protocol `{other}` for `{service_key}`"

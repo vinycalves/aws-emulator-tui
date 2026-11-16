@@ -26,6 +26,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     match app.tab {
         Tab::Explorer => draw_explorer(frame, app, chunks[2]),
+        Tab::Browse => draw_browse(frame, app, chunks[2]),
         Tab::Console => draw_console(frame, app, chunks[2]),
         Tab::Emulator => draw_emulator(frame, app, chunks[2]),
         Tab::Requests => draw_requests(frame, app, chunks[2]),
@@ -60,6 +61,13 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     if !app.identity.is_empty() {
         left.push(Span::styled("  │ ", theme::muted()));
         left.push(Span::styled(truncate(&app.identity, 60), theme::muted()));
+    }
+    if app.read_only {
+        left.push(Span::styled("  │ ", theme::muted()));
+        left.push(Span::styled(
+            "READ-ONLY",
+            Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+        ));
     }
 
     frame.render_widget(
@@ -225,7 +233,7 @@ fn breadcrumb_line(app: &App) -> Line<'static> {
     }
     if app.health.is_up() {
         spans.push(Span::styled(
-            "   enter inspect · c create · d delete · / filter",
+            "   enter inspect · o children · x action · c create · d delete · / filter",
             Style::default().fg(theme::DIM),
         ));
     }
@@ -237,6 +245,7 @@ fn draw_resource_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.explorer.focus == Focus::Table;
 
     if let Some(error) = &app.explorer.error {
+        let hint = error_hint(error);
         let message = if error.contains("cannot reach")
             || error.contains("error sending request")
             || error.contains("connection")
@@ -246,8 +255,10 @@ fn draw_resource_table(frame: &mut Frame, app: &mut App, area: Rect) {
                 app.client.endpoint(),
                 error
             )
-        } else {
+        } else if hint.is_empty() {
             error.clone()
+        } else {
+            format!("{error}\n\n{hint}")
         };
         let paragraph = Paragraph::new(message)
             .block(
@@ -463,11 +474,17 @@ fn draw_console_response(frame: &mut Frame, app: &mut App, area: Rect) {
         _ => (" response ", theme::muted()),
     };
     let body = if let Some(error) = &app.console.error {
-        if app.console.response.is_empty() {
+        let hint = error_hint(error);
+        let mut body = if app.console.response.is_empty() {
             error.clone()
         } else {
             format!("{error}\n\n{}", app.console.response)
+        };
+        if !hint.is_empty() {
+            body.push_str("\n\n");
+            body.push_str(hint);
         }
+        body
     } else if app.console.response.is_empty() {
         "Send a request with Ctrl+S to see the response.\n\nThe body is JSON. For query-protocol services it is flattened into form parameters automatically.".to_string()
     } else {
@@ -488,6 +505,244 @@ fn draw_console_response(frame: &mut Frame, app: &mut App, area: Rect) {
         .scroll((app.console.scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn draw_browse(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+    let status = app
+        .browse
+        .status
+        .map(|(code, ms)| format!("HTTP {code} · {ms} ms"))
+        .unwrap_or_else(|| "not run".to_string());
+    let rows = app
+        .browse
+        .table
+        .as_ref()
+        .map(|table| table.rows.len())
+        .unwrap_or(0);
+    let more = if app.browse.token.is_some() {
+        "  more pages (m)"
+    } else {
+        ""
+    };
+    let context = Line::from(vec![
+        Span::styled(" service ", Style::default().fg(theme::DIM)),
+        Span::styled(app.browse.service.clone(), theme::title()),
+        Span::styled("  op ", Style::default().fg(theme::DIM)),
+        Span::styled(
+            if app.browse.operation.is_empty() {
+                "<pick one>".to_string()
+            } else {
+                app.browse.operation.clone()
+            },
+            Style::default().fg(theme::TEXT),
+        ),
+        Span::styled("  rows ", Style::default().fg(theme::DIM)),
+        Span::styled(rows.to_string(), Style::default().fg(theme::TEXT)),
+        Span::styled("  ", theme::muted()),
+        Span::styled(status, theme::muted()),
+        Span::styled(more, Style::default().fg(theme::YELLOW)),
+        Span::styled(
+            "   s service · o operation · e input · r run · m more · enter detail",
+            Style::default().fg(theme::DIM),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(context), chunks[0]);
+
+    if let Some(error) = &app.browse.error {
+        let hint = error_hint(error);
+        let message = if hint.is_empty() {
+            error.clone()
+        } else {
+            format!("{error}\n\n{hint}")
+        };
+        frame.render_widget(
+            Paragraph::new(message)
+                .block(
+                    Block::bordered()
+                        .title(" browse error ")
+                        .border_style(Style::default().fg(theme::RED))
+                        .style(theme::panel()),
+                )
+                .wrap(Wrap { trim: false })
+                .style(theme::err()),
+            chunks[1],
+        );
+        return;
+    }
+
+    if app.browse.operation.is_empty() {
+        frame.render_widget(
+            Paragraph::new(
+                "Browse any service in the catalog.\n\n\n  s   pick a service (436 available)\n  o   pick an operation (list-like operations first)\n  e   edit the JSON input\n  r   run\n  m   next page\n",
+            )
+            .block(
+                Block::bordered()
+                    .title(" browse ")
+                    .border_style(Style::default().fg(theme::BORDER))
+                    .style(theme::panel()),
+            )
+            .style(theme::muted()),
+            chunks[1],
+        );
+        return;
+    }
+
+    let Some(table) = &app.browse.table else {
+        if app.browse.loading {
+            frame.render_widget(
+                Paragraph::new("Loading…")
+                    .block(
+                        Block::bordered()
+                            .title(" browse ")
+                            .border_style(Style::default().fg(theme::BORDER))
+                            .style(theme::panel()),
+                    )
+                    .style(theme::muted()),
+                chunks[1],
+            );
+        }
+        return;
+    };
+
+    let columns = table.columns.clone();
+    let visible: Vec<Vec<String>> = app
+        .browse
+        .visible_rows()
+        .iter()
+        .map(|row| row.cells.clone())
+        .collect();
+    let filter = app.browse.filter.clone();
+    render_table_panel(
+        frame,
+        chunks[1],
+        &format!("{}.{}", app.browse.service, app.browse.operation),
+        &columns,
+        &visible,
+        &mut app.browse.table_state,
+        true,
+        filter.as_deref(),
+        Some(" no rows · e edit input · r run · s service · o operation "),
+    );
+
+    if app.browse.loading {
+        let hint = Rect {
+            x: chunks[1].x + chunks[1].width.saturating_sub(12),
+            y: chunks[1].y,
+            width: 10,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(" loading… ").style(Style::default().fg(theme::YELLOW)),
+            hint,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_table_panel(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    columns: &[String],
+    rows: &[Vec<String>],
+    state: &mut ratatui::widgets::TableState,
+    focused: bool,
+    filter: Option<&str>,
+    empty_hint: Option<&str>,
+) {
+    let table_rows: Vec<Row> = rows
+        .iter()
+        .map(|row| {
+            Row::new(
+                row.iter()
+                    .map(|value| Cell::from(value.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let header = Row::new(
+        columns
+            .iter()
+            .map(|column| Cell::from(column.clone()))
+            .collect::<Vec<_>>(),
+    )
+    .style(
+        Style::default()
+            .fg(theme::ORANGE)
+            .add_modifier(Modifier::BOLD),
+    );
+    let mut widths: Vec<Constraint> = Vec::new();
+    for (index, column) in columns.iter().enumerate() {
+        let content = rows
+            .iter()
+            .filter_map(|row| row.get(index))
+            .map(|cell| cell.chars().count())
+            .max()
+            .unwrap_or(0);
+        let width = (content.max(column.chars().count()) as u16 + 2).clamp(8, 42);
+        if index == 0 {
+            widths.push(Constraint::Length(width.clamp(12, 45)));
+        } else {
+            widths.push(Constraint::Length(width));
+        }
+    }
+    let mut heading = vec![
+        Span::raw(" "),
+        Span::styled(title.to_string(), theme::title()),
+    ];
+    if let Some(filter) = filter {
+        heading.push(Span::styled(
+            format!("  filter: {filter}"),
+            Style::default().fg(theme::YELLOW),
+        ));
+    }
+    heading.push(Span::raw(" "));
+    let empty = rows.is_empty();
+    let mut block = Block::bordered()
+        .title(Line::from(heading))
+        .border_style(if focused {
+            Style::default().fg(theme::BORDER_FOCUS)
+        } else {
+            Style::default().fg(theme::BORDER)
+        })
+        .style(theme::panel());
+    if empty {
+        if let Some(hint) = empty_hint {
+            block = block.title_bottom(Line::from(hint).alignment(Alignment::Right));
+        }
+    }
+    let table = Table::new(table_rows, widths)
+        .header(header)
+        .column_spacing(1)
+        .block(block)
+        .row_highlight_style(if focused {
+            theme::selected()
+        } else {
+            Style::default().bg(theme::PANEL_ALT)
+        })
+        .highlight_symbol("");
+    frame.render_stateful_widget(table, area, state);
+}
+
+fn error_hint(error: &str) -> &'static str {
+    if error.contains("not implemented") || error.contains("NotImplemented") {
+        "This operation is not implemented by the emulator. Try a List/Describe operation, or check the emulator's fidelity scores."
+    } else if error.contains("403")
+        || error.contains("SignatureDoesNotMatch")
+        || error.contains("InvalidClientTokenId")
+        || error.contains("NoCredentials")
+    {
+        "The emulator rejected the credentials. Press r on the Emulator tab to reload the generated keys, or start the emulator with --auth off."
+    } else if error.contains("uses REST-XML") {
+        "This service uses REST-XML, which is not implemented in the generic browser yet. S3 has dedicated screens; other REST-XML services are on the roadmap."
+    } else if error.contains("no emulated service is registered") {
+        "This signing name is not mounted in this emulator build. The Console uses the signing name from the catalog."
+    } else if error.contains("cannot reach") || error.contains("error sending request") {
+        "Is the emulator running? Start it from the Emulator tab, or run aws-emulator."
+    } else {
+        ""
+    }
 }
 
 fn draw_emulator(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -697,7 +952,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             " ↑↓ service · g/G first/last · l table · a all services · ? help"
         }
         Tab::Explorer => {
-            " ↑↓ row · enter inspect · c create · d delete · / filter · v subview · esc back · ? help"
+            " ↑↓ row · enter inspect · o children · x action · c create · d delete · y copy · ctrl+p palette"
+        }
+        Tab::Browse => {
+            " s service · o operation · e input · r run · m next page · enter detail · / filter · y copy · esc explorer"
         }
         Tab::Console if app.console.focus_editor => {
             " editing request · esc done · ctrl+s send"
@@ -970,8 +1228,12 @@ fn help_text() -> Text<'static> {
         Line::from(Span::styled("AWS Emulator TUI", theme::title())),
         Line::from(""),
         Line::from(Span::styled("Global", Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD))),
-        help_line("1–4 / Tab", "switch tab"),
+        help_line("1–5 / Tab", "switch tab"),
         help_line("a", "browse all services in the catalog (436)"),
+        help_line("Ctrl+P / :", "command palette"),
+        help_line("Ctrl+E", "export the current table to JSON"),
+        help_line("D", "run diagnostics"),
+        help_line("y", "copy the selected row (OSC52)"),
         help_line("?", "this help"),
         help_line("q / Ctrl+C", "quit (stops the emulator if this TUI started it)"),
         Line::from(""),
@@ -979,15 +1241,23 @@ fn help_text() -> Text<'static> {
         help_line("h / l", "move focus between services and resources"),
         help_line("g / G", "first / last service"),
         help_line("↑↓ / j k", "move the selection"),
-        help_line("enter", "inspect, or open a bucket"),
+        help_line("enter", "inspect, or preview an S3 object"),
+        help_line("o", "open the children of a row (table, queue, stack, …)"),
+        help_line("x", "extra action (send, publish, invoke, start)"),
         help_line("esc", "close detail / go back"),
         help_line("c", "create a resource"),
         help_line("d", "delete the selected resource"),
         help_line("r", "refresh"),
         help_line("/", "filter rows"),
-        help_line("x", "clear the filter"),
+        help_line("X", "clear the filter"),
         help_line("v", "cycle IAM users/roles"),
         help_line("PgUp/PgDn", "scroll the detail pane"),
+        Line::from(""),
+        Line::from(Span::styled("Browse", Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD))),
+        help_line("s / o", "pick a service / operation"),
+        help_line("e / r", "edit the input / run it"),
+        help_line("m", "load the next page"),
+        help_line("enter", "open the row as JSON"),
         Line::from(""),
         Line::from(Span::styled("Console", Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD))),
         help_line("s / o", "pick service / operation"),
@@ -999,6 +1269,10 @@ fn help_text() -> Text<'static> {
         Line::from(Span::styled("Emulator", Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD))),
         help_line("s / x / R", "start / stop / restart"),
         help_line("g / c", "follow logs / clear logs"),
+        help_line("r", "reload endpoint, credentials, and certificate"),
+        Line::from(""),
+        Line::from(Span::styled("Read-only", Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD))),
+        help_line("Ctrl+P", "toggle read-only mode from the palette"),
         Line::from(""),
         Line::from(Span::styled("Requests", Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD))),
         help_line("↑↓ / enter", "select / open a request"),

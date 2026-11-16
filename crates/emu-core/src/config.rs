@@ -272,6 +272,59 @@ pub fn port_from_endpoint(endpoint: &str) -> Option<u16> {
     port.parse().ok()
 }
 
+/// One emulator instance found under `~/.aws/emulator/`.
+#[derive(Clone, Debug)]
+pub struct DiscoveredEndpoint {
+    pub port: u16,
+    pub endpoint: String,
+    pub region: String,
+    pub directory: PathBuf,
+}
+
+/// Scan `~/.aws/emulator/*/config` for emulator instances.
+pub fn discovered_endpoints() -> Vec<DiscoveredEndpoint> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let root = home.join(".aws").join("emulator");
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut endpoints = Vec::new();
+    for entry in entries.flatten() {
+        let directory = entry.path();
+        if !directory.is_dir() {
+            continue;
+        }
+        let Some(port) = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let config = directory.join("config");
+        let sections = parse_ini(&config);
+        let default = sections.get("default").cloned().unwrap_or_default();
+        let endpoint = default
+            .get("endpoint_url")
+            .cloned()
+            .unwrap_or_else(|| format!("https://127.0.0.1:{port}"));
+        let region = default
+            .get("region")
+            .cloned()
+            .unwrap_or_else(|| "us-east-1".to_string());
+        endpoints.push(DiscoveredEndpoint {
+            port,
+            endpoint,
+            region,
+            directory,
+        });
+    }
+    endpoints.sort_by_key(|endpoint| endpoint.port);
+    endpoints
+}
+
 /// Locate the emulator binary.
 pub fn find_binary() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("AWS_EMULATOR_BIN") {

@@ -42,12 +42,13 @@ for an honest comparison.
 │ ORCHESTRATION          ││    "TableStatus": "ACTIVE",                                                              │
 │ Step Functions  ●      ││    …                                                                                     │
 └─────── a  all services ┘└──────────────────────────────────────────────────────────────────────────────────────────┘
- ↑↓ row · enter inspect · c create · d delete · / filter · v subview · esc back · ? help
+ ↑↓ row · enter inspect · o children · x action · c create · d delete · y copy · ctrl+p palette
 ```
 
 The screenshot above is an abridged capture (rows and columns elided for
-readability); `docs/screenshot-explorer.txt` has the full 150-column version. A
-console capture is in `docs/screenshot-console.txt`.
+readability); `docs/screenshot-explorer.txt` has the full 150-column version.
+`docs/screenshot-browse.txt` shows the generic browser and
+`docs/screenshot-console.txt` shows the API console.
 
 ## Why
 
@@ -66,20 +67,38 @@ console, including services that have no curated screen.
 
 ## Features
 
-- **Explorer** — live resource tables for 16 services, with create, inspect, and
-  delete actions where the emulator supports them.
-- **All services** — press `a` to search the full 436-service catalog; pick a
-  service and an operation, edit the JSON input, send it.
+- **Explorer** — live resource tables for 16 services, with create, inspect,
+  delete, and per-row actions (send, publish, invoke, start) where the emulator
+  supports them.
+- **Browse all services** — a generic, model-free browser over the 436-service
+  catalog for the protocols the client shapes (JSON, query, EC2, and
+  REST-JSON; S3 has its own screens): pick a service, pick a `List`/`Describe`
+  operation, edit the JSON input, and get a table. It finds the records in the
+  response, derives the columns, and follows
+  `NextToken`/`Marker`/`LastEvaluatedKey` for the next page.
+- **Drill-downs** — open the children of a row without leaving the keyboard:
+  DynamoDB table → items, SQS queue → messages, log group → streams,
+  CloudFormation stack → resources, SNS topic → subscriptions, ECS cluster →
+  services, ECR repository → images, and more.
 - **Protocol aware** — JSON (1.0/1.1), query, EC2 query, and REST-JSON requests
   are shaped and signed correctly. The S3 screen uses REST-XML directly.
 - **SigV4** — every request is signed with the credentials the emulator
   generates; works with `--auth on` (the default) and `--auth off`.
 - **Emulator supervisor** — start, stop, restart, and tail the emulator's JSON
   logs from the Emulator tab. Started processes run with telemetry off.
+- **Diagnostics** — `D` checks health, identity, credentials, CA, state-dir
+  permissions, the binary version, and every curated service probe.
+- **Command palette** — `Ctrl+P` or `:` to jump, run diagnostics, toggle
+  read-only, export, copy, switch endpoint, and start/stop the emulator.
+- **Read-only mode** — blocks writes from create, delete, the console, and
+  Browse (prefix-based, a convenience rather than a security boundary).
+- **Export and copy** — `Ctrl+E` writes the current table to JSON; `y` copies
+  the selected row with OSC52 (works over SSH in terminals that support it).
 - **Request history** — every call is recorded with status, duration, and
   request/response bodies.
 - **No web UI, no extra service** — one binary, runs over SSH, uses the
-  emulator's own HTTPS endpoint and CA.
+  emulator's own HTTPS endpoint and CA. It can even switch between the
+  emulator instances it finds under `~/.aws/emulator/`.
 
 ## Install
 
@@ -146,18 +165,30 @@ useful in scripts and CI.
 
 | Context | Key | Action |
 | --- | --- | --- |
-| Global | `1`–`4`, `Tab` | Switch tab |
-| Global | `a` | All services (catalog picker) |
+| Global | `1`–`5`, `Tab` | Switch tab |
+| Global | `a` | Browse all services (catalog picker) |
+| Global | `Ctrl+P`, `:` | Command palette |
+| Global | `Ctrl+E` | Export the current table to JSON |
+| Global | `D` | Diagnostics |
 | Global | `?`, `F1` | Help |
 | Global | `q`, `Ctrl+C` | Quit (stops a TUI-started emulator) |
 | Explorer | `h` / `l` | Focus services / resources |
 | Explorer | `↑↓` / `j k` | Move selection |
-| Explorer | `Enter` | Inspect, or open an S3 bucket |
+| Explorer | `Enter` | Inspect, preview an S3 object, or open a bucket |
+| Explorer | `o` | Open the row's children (items, messages, streams, stacks, …) |
+| Explorer | `x` | Per-row action: send, publish, invoke, start execution |
 | Explorer | `Esc` | Close detail / go back |
 | Explorer | `c` / `d` | Create / delete |
 | Explorer | `r` | Refresh |
-| Explorer | `/` / `x` | Filter / clear filter |
+| Explorer | `/` / `X` | Filter / clear filter |
+| Explorer | `y` | Copy the selected row (OSC52) |
 | Explorer | `v` | Cycle IAM users and roles |
+| Browse | `s` / `o` | Pick service / operation |
+| Browse | `e` / `r` | Edit the JSON input / run it |
+| Browse | `m` | Load the next page |
+| Browse | `Enter` | Open the row as JSON |
+| Browse | `/` / `x` | Filter / clear filter |
+| Browse | `y` | Copy the selected row |
 | Console | `s` / `o` | Pick service / operation |
 | Console | `e` | Edit the JSON request |
 | Console | `Ctrl+S`, `F5` | Send |
@@ -171,24 +202,24 @@ useful in scripts and CI.
 
 ## Services with a curated view
 
-| Service | Views | Create | Delete |
-| --- | --- | --- | --- |
-| S3 | Buckets, objects | bucket | bucket, object |
-| DynamoDB | Tables | table (JSON) | table |
-| SQS | Queues | queue | queue |
-| SNS | Topics | topic | topic |
-| Lambda | Functions | — | function |
-| EC2 | Instances | — | — |
-| ECS | Clusters | cluster | cluster |
-| ECR | Repositories | repository | repository |
-| IAM | Users, roles | — | user, role |
-| KMS | Keys | key | schedule deletion |
-| Secrets Manager | Secrets | secret (JSON) | secret |
-| SSM | Parameters | parameter (JSON) | parameter |
-| CloudFormation | Stacks | — | stack |
-| CloudWatch Logs | Log groups | group | group |
-| EventBridge | Event buses | bus | bus |
-| Step Functions | State machines | state machine (JSON) | state machine |
+| Service | Views | Create | Delete | Children (`o`) | Action (`x`) |
+| --- | --- | --- | --- | --- | --- |
+| S3 | Buckets, objects | bucket | bucket, object | objects, preview | — |
+| DynamoDB | Tables | table (JSON) | table | items (`Scan`) | — |
+| SQS | Queues | queue | queue | messages (`ReceiveMessage`) | send |
+| SNS | Topics | topic | topic | subscriptions | publish |
+| Lambda | Functions | — | function | event source mappings | invoke |
+| EC2 | Instances | — | — | — | — |
+| ECS | Clusters | cluster | cluster | services | — |
+| ECR | Repositories | repository | repository | images | — |
+| IAM | Users, roles | — | user, role | attached policies | — |
+| KMS | Keys | key | schedule deletion | grants | — |
+| Secrets Manager | Secrets | secret (JSON) | secret | — | — |
+| SSM | Parameters | parameter (JSON) | parameter | — | — |
+| CloudFormation | Stacks | — | stack | stack resources | — |
+| CloudWatch Logs | Log groups | group | group | log streams | — |
+| EventBridge | Event buses | bus | bus | rules | — |
+| Step Functions | State machines | state machine (JSON) | state machine | executions | start |
 
 Every other service is still reachable through the Console.
 
@@ -296,10 +327,18 @@ want both of those things in the terminal.
 - The emulator is the source of truth for fidelity. A missing operation or a
   wrong response is an emulator gap, not a TUI bug; check its `issues/` folder
   and release fidelity scores.
-- List calls show the first page returned. Pagination (`NextToken`) is not
-  followed yet.
-- The Console shapes REST-JSON and query requests, but not arbitrary REST-XML
-  bodies. S3 is covered by its dedicated screens.
+- Curated Explorer tables show the first page returned. The Browse tab follows
+  `NextToken`, `Marker`, `NextContinuationToken`, and `LastEvaluatedKey`.
+- The Console and Browse use a JSON editor, not schema-generated forms.
+  Validation is delegated to the emulator.
+- REST-XML bodies are only implemented for S3's dedicated screens. The Browse
+  tab covers JSON, query, EC2, and REST-JSON services.
+- Read-only mode is a prefix-based convenience, not a security boundary. Use
+  IAM policy or a read-only credential when you need a guarantee.
+- There is no state snapshot or restore yet; the emulator keeps everything in
+  memory.
+- One endpoint is active at a time. Switching is instant, but history is not
+  partitioned per endpoint.
 - One account and one region, matching the emulator.
 - The emulator keeps resources in memory. Stopping it discards everything.
 - The TUI reads the emulator's generated credentials; protect your home
