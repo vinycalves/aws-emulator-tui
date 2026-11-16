@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Format, lint, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  emulator-smoke:
+    name: Live emulator smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build -p emu-tui -p emu-core
+      - name: Install AWS Emulator
+        run: |
+          curl -fsSLo /tmp/aws-emulator.deb \
+            https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest/aws-emulator_amd64.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y /tmp/aws-emulator.deb
+      - name: Start AWS Emulator
+        run: |
+          aws-emulator -t off > /tmp/emulator.log 2>&1 &
+          for _ in $(seq 1 60); do
+            if curl -sk https://127.0.0.1:9297/__admin/health | grep -q ok; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/emulator.log
+          exit 1
+      - name: Probe every curated service
+        run: ./target/debug/emutui --check
+      - name: Run the library smoke test
+        run: cargo run -q -p emu-core --example smoke
