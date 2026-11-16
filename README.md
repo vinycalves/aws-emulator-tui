@@ -6,9 +6,12 @@ emulator, without leaving the terminal.
 
 AWS Emulator is a local emulator of the AWS APIs. It has no graphical interface:
 you point an SDK or the AWS CLI at `https://127.0.0.1:9297` and drive it with API
-calls. This project gives it the interface it lacks. It is an ordinary AWS API
+calls. This project gives it a terminal interface. It is an ordinary AWS API
 client — it does not fork, patch, or embed the emulator — so it works with the
 installed package, the Docker image, or any emulator-compatible endpoint.
+
+Community web and desktop consoles exist too; see [Related work](#related-work)
+for an honest comparison.
 
 ```
  AWS EMULATOR TUI │ https://127.0.0.1:9297  ● healthy  │ us-east-1  │ 000000000000 · arn:aws:iam::…/user/emulator
@@ -255,6 +258,38 @@ a report. Regenerate the catalog with `python3 scripts/generate-catalog.py`
 
 The CI workflow runs formatting, clippy, tests, and an end-to-end job that
 installs AWS Emulator, starts it, and runs `emutui --check`.
+
+## Related work
+
+There are already ways to look at local AWS resources. This project is the
+terminal one built around AWS Emulator's own files and lifecycle.
+
+| Project | Form | Notes |
+| --- | --- | --- |
+| [StackPort](https://github.com/DaviReisVieira/stackport) | Web console (MIT) | The closest existing project for AWS Emulator: 51 services, 14 dedicated views, an API Explorer with forms and pagination, writes, and activity. Reads the emulator's keys and certificate from `~/.aws/emulator/<port>/`. Python + React, runs from `pip` or Docker. |
+| [taws](https://github.com/huseyinbabal/taws) | TUI (MIT, Rust/Ratatui) | 30 services and 51 resource types for real AWS. Supports `--endpoint-url`, `AWS_ENDPOINT_URL`, and `AWS_CA_BUNDLE`, so it can be pointed at an emulator with those three settings. |
+| [LocalStack Desktop](https://github.com/localstack/localstack-desktop) | Desktop app | LocalStack only: start/stop, logs, shell, and a resource browser. |
+| [lstk](https://docs.localstack.cloud/aws/developer-tools/running-localstack/lstk/) | CLI with a TUI | LocalStack lifecycle and the first-run/startup flow; resource browsing lives in LocalStack Desktop and the web app. |
+| [stu](https://github.com/lusingander/stu) / [DDV](https://github.com/lusingander/ddv) | TUI | Single-service explorers for S3 and DynamoDB. |
+| [Floci UI](https://github.com/floci-io/floci-ui) / [floci-dash](https://github.com/ofsazib/floci-dash) | Web | Dashboards for the Floci emulator. |
+| Moto's `/moto-api/` | Web | A small state-inspection page served by `moto_server`. |
+
+AWS Emulator's issue tracker has an open request for a dashboard:
+[aws/aws-emulator#374](https://github.com/aws/aws-emulator/issues/374).
+
+What this project adds to that landscape:
+
+- it is a TUI, so it works over SSH and needs no browser, Python, Node, or
+  container;
+- it discovers the emulator's endpoint, keys, and certificate by itself, and can
+  start, stop, and restart the emulator, tail its JSON logs, and disable
+  telemetry for processes it starts;
+- its console exposes the emulator's whole wire surface — 436 services and
+  19,607 operations — instead of only services with a hand-written screen.
+
+If you want a polished browser console for AWS Emulator today, use StackPort.
+If you want a mature TUI for real AWS, use taws. This project is for people who
+want both of those things in the terminal.
 
 ## Limitations
 
