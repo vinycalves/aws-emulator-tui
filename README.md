@@ -59,6 +59,16 @@ readability); `docs/screenshot-explorer.txt` has the full 150-column version.
 `docs/screenshot-browse.txt` shows the generic browser and
 `docs/screenshot-console.txt` shows the API console.
 
+## Demo
+
+![emutui demo](docs/demo.gif)
+
+[Watch the 21-second MP4](docs/demo.mp4) — the VHS tape, isolated setup script,
+post-production script, platform guide, and voiceover script are in
+[`demo/`](demo/). The recording is reproducible with one command, and the demo
+emulator runs on its own port and HOME so it never touches your development
+instance.
+
 ## Why
 
 The emulator is excellent at what it does — a fast, offline AWS API endpoint —

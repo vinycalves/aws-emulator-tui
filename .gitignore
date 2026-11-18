@@ -2,3 +2,7 @@
 **/*.rs.bk
 .env
 .DS_Store
+# Demo environment (generated)
+.demo/
+demo/env.sh
+docs/demo-raw.mp4

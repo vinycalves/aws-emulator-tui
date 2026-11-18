@@ -53,6 +53,9 @@ aws dynamodb put-item \
 
 # Messaging.
 aws sqs create-queue --queue-name jobs >/dev/null 2>&1 || true
+aws sqs send-message \
+  --queue-url "https://sqs.${REGION}.amazonaws.com/000000000000/jobs" \
+  --message-body "hello from emutui" >/dev/null 2>&1 || true
 aws sns create-topic --name alerts >/dev/null 2>&1 || true
 aws events create-event-bus --name demo-bus >/dev/null 2>&1 || true
 
