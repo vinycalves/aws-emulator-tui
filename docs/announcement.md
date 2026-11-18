@@ -36,6 +36,9 @@ botocore's service models. MIT licensed.
 
 Repo: https://github.com/vinycalves/aws-emulator-tui
 
+Independent project, not affiliated with or endorsed by AWS. “AWS” and “Amazon
+Web Services” are trademarks of Amazon.com, Inc. or its affiliates.
+
 #Rust #AWS #OpenSource #TUI #DeveloperTools #CloudNative #AWSCommunity
 
 ## X / short post
@@ -44,7 +47,7 @@ I built emutui — a terminal console for AWS Emulator.
 
 Browse 436 AWS services, drill into DynamoDB items / SQS messages / CFN
 resources, invoke any operation, and start/stop the emulator — all from the
-terminal. One Rust binary, SigV4, MIT.
+terminal. One Rust binary, SigV4, MIT, not affiliated with AWS.
 
 https://github.com/vinycalves/aws-emulator-tui
 
@@ -66,7 +69,7 @@ signs every request with SigV4, and gives you:
 - diagnostics, read-only mode, export, copy, and endpoint switching
 
 It is a ~5.7 MB Rust binary (Ratatui + Tokio), MIT licensed, and it does not
-fork or embed the emulator.
+fork or embed the emulator. Independent project, not affiliated with AWS.
 
 Repo: https://github.com/vinycalves/aws-emulator-tui
 

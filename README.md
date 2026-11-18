@@ -4,6 +4,11 @@
 [![Release](https://img.shields.io/github/v/release/vinycalves/aws-emulator-tui)](https://github.com/vinycalves/aws-emulator-tui/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+> **Independent project.** Not affiliated with, endorsed by, or sponsored by
+> Amazon Web Services. “AWS”, “Amazon Web Services”, and “AWS Emulator” are
+> trademarks of Amazon.com, Inc. or its affiliates. This tool is a separate
+> client; it does not include AWS code or the emulator binary.
+
 A terminal console for [AWS Emulator](https://github.com/aws/aws-emulator) — browse
 resources, create and delete them, invoke any operation, and start or stop the
 emulator, without leaving the terminal.

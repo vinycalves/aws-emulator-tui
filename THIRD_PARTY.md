@@ -12,7 +12,9 @@ protocols, SigV4 signing names, operation names, required-input skeletons, and
 HTTP bindings. Documentation, examples, and output shapes are discarded. The
 generator is `scripts/generate-catalog.py`.
 
-A copy of the Apache License 2.0 is in `LICENSES/Apache-2.0.txt`.
+The upstream attribution notice is reproduced in
+`LICENSES/botocore-NOTICE`, and a copy of the Apache License 2.0 is in
+`LICENSES/Apache-2.0.txt`.
 
 ## AWS Emulator
 
