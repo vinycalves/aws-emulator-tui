@@ -73,6 +73,11 @@ else
 fi
 
 if command -v curl >/dev/null 2>&1 && curl -sk "${ENDPOINT}/__admin/health" 2>/dev/null | grep -q ok; then
+  if [[ ! -f "${DEMO_HOME}/.aws/emulator/${PORT}/emulator_credentials" ]]; then
+    echo "Port ${PORT} is already used by another emulator, not the demo HOME." >&2
+    echo "Stop it, or run with EMULATOR_PORT=<other-port>." >&2
+    exit 1
+  fi
   echo "Emulator already running at ${ENDPOINT}"
 else
   echo "Starting AWS Emulator on ${ENDPOINT} (HOME=${DEMO_HOME})"
